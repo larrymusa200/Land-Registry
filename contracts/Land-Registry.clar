@@ -357,4 +357,269 @@
     (ok true)
   )
 )
+;; Helper function to check if a principal is the owner of a property
+(define-private (is-property-owner (property-id uint) (caller principal))
+  (match (map-get? properties { property-id: property-id })
+    property (is-eq (get owner property) caller)
+    false
+  )
+)
 
+;; Dispute status constants
+(define-constant DISPUTE-PENDING u1)
+(define-constant DISPUTE-RESOLVED u2)
+(define-constant DISPUTE-REJECTED u3)
+
+;; Dispute mapping
+(define-map property-disputes
+  { property-id: uint, dispute-id: uint }
+  {
+    complainant: principal,
+    description: (string-ascii 200),
+    status: uint,
+    filed-at: uint,
+    resolved-at: (optional uint),
+    resolver: (optional principal)
+  }
+)
+
+(define-data-var next-dispute-id uint u1)
+
+(define-public (file-dispute (property-id uint) (description (string-ascii 200)))
+  (let 
+    ((dispute-id (var-get next-dispute-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (map-set property-disputes
+      { property-id: property-id, dispute-id: dispute-id }
+      {
+        complainant: tx-sender,
+        description: description,
+        status: DISPUTE-PENDING,
+        filed-at: current-time,
+        resolved-at: none,
+        resolver: none
+      }
+    )
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+
+
+(define-map property-valuations
+  { property-id: uint, valuation-id: uint }
+  {
+    value: uint,
+    appraiser: principal,
+    timestamp: uint,
+    notes: (string-ascii 100)
+  }
+)
+
+(define-data-var next-valuation-id uint u1)
+
+(define-public (add-property-valuation (property-id uint) (value uint) (notes (string-ascii 100)))
+  (let 
+    ((valuation-id (var-get next-valuation-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    (map-set property-valuations
+      { property-id: property-id, valuation-id: valuation-id }
+      {
+        value: value,
+        appraiser: tx-sender,
+        timestamp: current-time,
+        notes: notes
+      }
+    )
+    (var-set next-valuation-id (+ valuation-id u1))
+    (ok valuation-id)
+  )
+)
+
+
+
+(define-map property-liens
+  { property-id: uint }
+  {
+    lender: principal,
+    amount: uint,
+    start-date: uint,
+    end-date: uint,
+    active: bool
+  }
+)
+
+(define-public (register-lien 
+    (property-id uint) 
+    (amount uint)
+    (duration uint))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (end-time (+ current-time duration)))
+     (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    (ok (map-set property-liens
+      { property-id: property-id }
+      {
+        lender: tx-sender,
+        amount: amount,
+        start-date: current-time,
+        end-date: end-time,
+        active: true
+      }))
+  )
+)
+
+
+
+(define-map property-rentals
+  { property-id: uint }
+  {
+    tenant: (optional principal),
+    monthly-rent: uint,
+    lease-start: uint,
+    lease-end: uint,
+    active: bool
+  }
+)
+
+(define-public (create-rental-listing 
+    (property-id uint) 
+    (monthly-rent uint)
+    (lease-duration uint))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (asserts! (is-property-owner property-id tx-sender) ERR-NOT-OWNER)
+    (ok (map-set property-rentals
+      { property-id: property-id }
+      {
+        tenant: none,
+        monthly-rent: monthly-rent,
+        lease-start: current-time,
+        lease-end: (+ current-time lease-duration),
+        active: true
+      }))
+  )
+)
+
+
+(define-map subdivided-properties
+  { parent-id: uint, sub-id: uint }
+  {
+    owner: principal,
+    area: uint,
+    verified: bool
+  }
+)
+
+(define-public (subdivide-property 
+    (property-id uint) 
+    (sub-areas (list 10 uint)))
+  (let 
+    ((property (unwrap! (get-property property-id) ERR-PROPERTY-NOT-FOUND))
+     (total-area (get area property)))
+    (asserts! (is-property-owner property-id tx-sender) ERR-NOT-OWNER)
+    (asserts! (get verified property) ERR-VERIFICATION-REQUIRED)
+    ;; Additional logic to create subdivided properties
+    (ok true)
+  )
+)
+
+
+(define-map property-documents
+  { property-id: uint, document-id: uint }
+  {
+    document-hash: (buff 32),
+    document-type: (string-ascii 50),
+    upload-date: uint,
+    uploader: principal
+  }
+)
+
+(define-data-var next-document-id uint u1)
+
+(define-public (add-property-document 
+    (property-id uint) 
+    (document-hash (buff 32))
+    (document-type (string-ascii 50)))
+  (let 
+    ((doc-id (var-get next-document-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (asserts! (is-property-owner property-id tx-sender) ERR-NOT-OWNER)
+    (map-set property-documents
+      { property-id: property-id, document-id: doc-id }
+      {
+        document-hash: document-hash,
+        document-type: document-type,
+        upload-date: current-time,
+        uploader: tx-sender
+      }
+    )
+    (var-set next-document-id (+ doc-id u1))
+    (ok doc-id)
+  )
+)
+
+
+(define-map property-insurance
+  { property-id: uint }
+  {
+    insurer: principal,
+    coverage-amount: uint,
+    start-date: uint,
+    end-date: uint,
+    policy-id: (string-ascii 50),
+    active: bool
+  }
+)
+
+(define-public (register-insurance 
+    (property-id uint)
+    (coverage-amount uint)
+    (duration uint)
+    (policy-id (string-ascii 50)))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+
+    (ok (map-set property-insurance
+      { property-id: property-id }
+      {
+        insurer: tx-sender,
+        coverage-amount: coverage-amount,
+        start-date: current-time,
+        end-date: (+ current-time duration),
+        policy-id: policy-id,
+        active: true
+      }))
+  )
+)
+
+
+(define-map property-taxes
+  { property-id: uint, year: uint }
+  {
+    amount: uint,
+    paid: bool,
+    payment-date: (optional uint),
+    payment-tx: (optional (buff 32))
+  }
+)
+
+(define-public (register-property-tax 
+    (property-id uint)
+    (year uint)
+    (amount uint))
+  (begin
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    (ok (map-set property-taxes
+      { property-id: property-id, year: year }
+      {
+        amount: amount,
+        paid: false,
+        payment-date: none,
+        payment-tx: none
+      }))
+  )
+)
