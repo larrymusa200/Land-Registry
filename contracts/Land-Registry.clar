@@ -623,3 +623,96 @@
       }))
   )
 )
+
+
+(define-map maintenance-records
+  { property-id: uint, record-id: uint }
+  {
+    provider: principal,
+    maintenance-type: (string-ascii 50),
+    cost: uint,
+    date: uint,
+    description: (string-ascii 200),
+    warranty-end: (optional uint)
+  }
+)
+
+(define-data-var next-maintenance-id uint u1)
+
+(define-public (add-maintenance-record
+    (property-id uint)
+    (maintenance-type (string-ascii 50))
+    (cost uint)
+    (description (string-ascii 200))
+    (warranty-duration (optional uint)))
+  (let 
+    ((record-id (var-get next-maintenance-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (warranty-end (match warranty-duration
+                    duration (some (+ current-time duration))
+                    none)))
+    (asserts! (or (is-property-owner property-id tx-sender) 
+                  (get active (is-verifier tx-sender))) 
+              ERR-NOT-AUTHORIZED)
+    (map-set maintenance-records
+      { property-id: property-id, record-id: record-id }
+      {
+        provider: tx-sender,
+        maintenance-type: maintenance-type,
+        cost: cost,
+        date: current-time,
+        description: description,
+        warranty-end: warranty-end
+      }
+    )
+    (var-set next-maintenance-id (+ record-id u1))
+    (ok record-id)
+  )
+)
+
+
+
+(define-map property-access-rights
+  { property-id: uint, grantee: principal }
+  {
+    granted-by: principal,
+    access-type: (string-ascii 50),
+    start-time: uint,
+    end-time: uint,
+    active: bool
+  }
+)
+
+(define-public (grant-property-access
+    (property-id uint)
+    (grantee principal)
+    (access-type (string-ascii 50))
+    (duration uint))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (asserts! (is-property-owner property-id tx-sender) ERR-NOT-OWNER)
+    (ok (map-set property-access-rights
+      { property-id: property-id, grantee: grantee }
+      {
+        granted-by: tx-sender,
+        access-type: access-type,
+        start-time: current-time,
+        end-time: (+ current-time duration),
+        active: true
+      }))
+  )
+)
+
+(define-public (revoke-property-access
+    (property-id uint)
+    (grantee principal))
+  (let 
+    ((access-right (unwrap! (map-get? property-access-rights 
+                            { property-id: property-id, grantee: grantee })
+                           (err u102))))
+    (asserts! (is-eq (get granted-by access-right) tx-sender) ERR-NOT-AUTHORIZED)
+    (ok (map-set property-access-rights
+      { property-id: property-id, grantee: grantee }
+      (merge access-right { active: false })))
+  )
+)
