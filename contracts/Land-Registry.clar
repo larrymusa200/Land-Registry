@@ -59,6 +59,46 @@
   }
 )
 
+
+(define-constant ERR-AUCTION-NOT-FOUND (err u110))
+(define-constant ERR-AUCTION-ENDED (err u111))
+(define-constant ERR-AUCTION-NOT-ENDED (err u112))
+(define-constant ERR-BID-TOO-LOW (err u113))
+(define-constant ERR-RESERVE-NOT-MET (err u114))
+(define-constant ERR-AUCTION-ACTIVE (err u115))
+(define-constant ERR-NO-BIDS (err u116))
+(define-constant ERR-REFUND-FAILED (err u117))
+
+(define-map property-auctions
+  { property-id: uint }
+  {
+    seller: principal,
+    start-time: uint,
+    end-time: uint,
+    reserve-price: uint,
+    highest-bid: uint,
+    highest-bidder: (optional principal),
+    total-bids: uint,
+    active: bool,
+    settled: bool
+  }
+)
+
+(define-map auction-bids
+  { property-id: uint, bid-id: uint }
+  {
+    bidder: principal,
+    amount: uint,
+    timestamp: uint,
+    refunded: bool
+  }
+)
+
+(define-map bidder-amounts
+  { property-id: uint, bidder: principal }
+  { total-amount: uint }
+)
+
 ;; Counter for property IDs
 (define-data-var next-property-id uint u1)
 
@@ -714,5 +754,218 @@
     (ok (map-set property-access-rights
       { property-id: property-id, grantee: grantee }
       (merge access-right { active: false })))
+  )
+)
+
+
+(define-read-only (get-auction (property-id uint))
+  (map-get? property-auctions { property-id: property-id })
+)
+
+(define-read-only (get-auction-bid (property-id uint) (bid-id uint))
+  (map-get? auction-bids { property-id: property-id, bid-id: bid-id })
+)
+
+(define-read-only (get-bidder-amount (property-id uint) (bidder principal))
+  (default-to { total-amount: u0 } 
+    (map-get? bidder-amounts { property-id: property-id, bidder: bidder }))
+)
+
+(define-read-only (is-auction-ended (property-id uint))
+  (match (get-auction property-id)
+    auction (let ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+              (>= current-time (get end-time auction)))
+    false
+  )
+)
+
+(define-public (create-auction 
+    (property-id uint) 
+    (duration uint) 
+    (reserve-price uint))
+  (let 
+    ((property (unwrap! (get-property property-id) ERR-PROPERTY-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (end-time (+ current-time duration)))
+    
+    (asserts! (is-eq (get owner property) tx-sender) ERR-NOT-OWNER)
+    (asserts! (get verified property) ERR-VERIFICATION-REQUIRED)
+    (asserts! (> reserve-price u0) ERR-INVALID-PRICE)
+    (asserts! (> duration u0) ERR-INVALID-PRICE)
+    (asserts! (is-none (get-auction property-id)) ERR-PROPERTY-EXISTS)
+    
+    (match (get-property-listing property-id)
+      listing (asserts! (not (get active listing)) ERR-AUCTION-ACTIVE)
+      true
+    )
+    
+    (map-set property-auctions
+      { property-id: property-id }
+      {
+        seller: tx-sender,
+        start-time: current-time,
+        end-time: end-time,
+        reserve-price: reserve-price,
+        highest-bid: u0,
+        highest-bidder: none,
+        total-bids: u0,
+        active: true,
+        settled: false
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (place-bid (property-id uint) (bid-amount uint))
+  (let 
+    ((auction (unwrap! (get-auction property-id) ERR-AUCTION-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (current-highest (get highest-bid auction))
+     (bid-id (+ (get total-bids auction) u1))
+     (current-bidder-amount (get total-amount (get-bidder-amount property-id tx-sender))))
+    
+    (asserts! (get active auction) ERR-AUCTION-NOT-FOUND)
+    (asserts! (< current-time (get end-time auction)) ERR-AUCTION-ENDED)
+    (asserts! (> bid-amount current-highest) ERR-BID-TOO-LOW)
+    (asserts! (> bid-amount u0) ERR-INVALID-PRICE)
+    
+    (unwrap! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)) ERR-INSUFFICIENT-FUNDS)
+    
+    (map-set auction-bids
+      { property-id: property-id, bid-id: bid-id }
+      {
+        bidder: tx-sender,
+        amount: bid-amount,
+        timestamp: current-time,
+        refunded: false
+      }
+    )
+    
+    (map-set bidder-amounts
+      { property-id: property-id, bidder: tx-sender }
+      { total-amount: (+ current-bidder-amount bid-amount) }
+    )
+    
+    (map-set property-auctions
+      { property-id: property-id }
+      (merge auction {
+        highest-bid: bid-amount,
+        highest-bidder: (some tx-sender),
+        total-bids: bid-id
+      })
+    )
+    
+    (ok bid-id)
+  )
+)
+
+(define-public (settle-auction (property-id uint))
+  (let 
+    ((auction (unwrap! (get-auction property-id) ERR-AUCTION-NOT-FOUND))
+     (property (unwrap! (get-property property-id) ERR-PROPERTY-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (highest-bid (get highest-bid auction))
+     (highest-bidder (get highest-bidder auction))
+     (seller (get seller auction))
+     (reserve-price (get reserve-price auction))
+     (transfer-count (get count (get-transfer-count property-id)))
+     (new-transfer-count (+ transfer-count u1)))
+    
+    (asserts! (get active auction) ERR-AUCTION-NOT-FOUND)
+    (asserts! (>= current-time (get end-time auction)) ERR-AUCTION-NOT-ENDED)
+    (asserts! (not (get settled auction)) ERR-AUCTION-ACTIVE)
+    (asserts! (> highest-bid u0) ERR-NO-BIDS)
+    (asserts! (>= highest-bid reserve-price) ERR-RESERVE-NOT-MET)
+    
+    (let ((winner (unwrap! highest-bidder ERR-NO-BIDS)))
+      (as-contract (unwrap! (stx-transfer? highest-bid tx-sender seller) ERR-TRANSFER-FAILED))
+      
+      (map-set properties
+        { property-id: property-id }
+        (merge property { owner: winner })
+      )
+      
+      (map-set property-history
+        { property-id: property-id, transfer-id: new-transfer-count }
+        {
+          from: seller,
+          to: winner,
+          price: highest-bid,
+          timestamp: current-time,
+          verified-by: (some winner)
+        }
+      )
+      
+      (map-set property-transfer-count
+        { property-id: property-id }
+        { count: new-transfer-count }
+      )
+      
+      (map-set property-auctions
+        { property-id: property-id }
+        (merge auction { active: false, settled: true })
+      )
+      
+      (ok winner)
+    )
+  )
+)
+
+(define-public (cancel-auction (property-id uint))
+  (let 
+    ((auction (unwrap! (get-auction property-id) ERR-AUCTION-NOT-FOUND)))
+    
+    (asserts! (is-eq (get seller auction) tx-sender) ERR-NOT-OWNER)
+    (asserts! (get active auction) ERR-AUCTION-NOT-FOUND)
+    (asserts! (is-eq (get total-bids auction) u0) ERR-AUCTION-ACTIVE)
+    
+    (map-set property-auctions
+      { property-id: property-id }
+      (merge auction { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (refund-unsuccessful-bid (property-id uint) (bidder principal))
+  (let 
+    ((auction (unwrap! (get-auction property-id) ERR-AUCTION-NOT-FOUND))
+     (bidder-amount (get total-amount (get-bidder-amount property-id bidder)))
+     (highest-bidder (get highest-bidder auction)))
+    
+    (asserts! (not (get active auction)) ERR-AUCTION-ACTIVE)
+    (asserts! (> bidder-amount u0) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (not (is-eq (some bidder) highest-bidder)) ERR-NOT-AUTHORIZED)
+    
+    (as-contract (unwrap! (stx-transfer? bidder-amount tx-sender bidder) ERR-REFUND-FAILED))
+    
+    (map-set bidder-amounts
+      { property-id: property-id, bidder: bidder }
+      { total-amount: u0 }
+    )
+    
+    (ok bidder-amount)
+  )
+)
+
+(define-public (extend-auction (property-id uint) (additional-time uint))
+  (let 
+    ((auction (unwrap! (get-auction property-id) ERR-AUCTION-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    
+    (asserts! (is-eq (get seller auction) tx-sender) ERR-NOT-OWNER)
+    (asserts! (get active auction) ERR-AUCTION-NOT-FOUND)
+    (asserts! (< current-time (get end-time auction)) ERR-AUCTION-ENDED)
+    (asserts! (> additional-time u0) ERR-INVALID-PRICE)
+    
+    (map-set property-auctions
+      { property-id: property-id }
+      (merge auction { end-time: (+ (get end-time auction) additional-time) })
+    )
+    
+    (ok (+ (get end-time auction) additional-time))
   )
 )
