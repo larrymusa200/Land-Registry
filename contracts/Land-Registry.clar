@@ -969,3 +969,136 @@
     (ok (+ (get end-time auction) additional-time))
   )
 )
+
+(define-constant ERR-VALUE-RECORD-NOT-FOUND (err u120))
+(define-constant ERR-INVALID-VALUE (err u121))
+(define-constant ERR-DUPLICATE-VALUE-ENTRY (err u122))
+
+(define-map property-market-values
+  { property-id: uint, value-id: uint }
+  {
+    market-value: uint,
+    assessor: principal,
+    assessment-date: uint,
+    value-source: (string-ascii 50),
+    confidence-level: uint,
+    notes: (string-ascii 200)
+  }
+)
+
+(define-map property-value-count
+  { property-id: uint }
+  { count: uint }
+)
+
+(define-data-var next-value-id uint u1)
+
+(define-public (record-property-value 
+    (property-id uint) 
+    (market-value uint) 
+    (value-source (string-ascii 50))
+    (confidence-level uint)
+    (notes (string-ascii 200)))
+  (let 
+    ((value-id (var-get next-value-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (property (unwrap! (get-property property-id) ERR-PROPERTY-NOT-FOUND))
+     (current-count (get count (default-to { count: u0 } 
+                                 (map-get? property-value-count { property-id: property-id })))))
+    
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    (asserts! (> market-value u0) ERR-INVALID-VALUE)
+    (asserts! (<= confidence-level u100) ERR-INVALID-VALUE)
+    
+    (map-set property-market-values
+      { property-id: property-id, value-id: value-id }
+      {
+        market-value: market-value,
+        assessor: tx-sender,
+        assessment-date: current-time,
+        value-source: value-source,
+        confidence-level: confidence-level,
+        notes: notes
+      }
+    )
+    
+    (map-set property-value-count
+      { property-id: property-id }
+      { count: (+ current-count u1) }
+    )
+    
+    (var-set next-value-id (+ value-id u1))
+    (ok value-id)
+  )
+)
+
+(define-public (update-property-value
+    (property-id uint)
+    (value-id uint)
+    (new-market-value uint)
+    (new-notes (string-ascii 200)))
+  (let 
+    ((value-record (unwrap! (map-get? property-market-values 
+                            { property-id: property-id, value-id: value-id }) 
+                           ERR-VALUE-RECORD-NOT-FOUND)))
+    
+    (asserts! (is-eq (get assessor value-record) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-market-value u0) ERR-INVALID-VALUE)
+    
+    (map-set property-market-values
+      { property-id: property-id, value-id: value-id }
+      (merge value-record { 
+        market-value: new-market-value,
+        notes: new-notes
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-property-value (property-id uint) (value-id uint))
+  (map-get? property-market-values { property-id: property-id, value-id: value-id })
+)
+
+(define-read-only (get-property-value-count (property-id uint))
+  (default-to { count: u0 } (map-get? property-value-count { property-id: property-id }))
+)
+
+(define-read-only (get-latest-property-value (property-id uint))
+  (let 
+    ((value-count (get count (get-property-value-count property-id))))
+    (if (> value-count u0)
+      (get-property-value property-id value-count)
+      none
+    )
+  )
+)
+
+(define-read-only (calculate-value-appreciation (property-id uint) (start-value-id uint) (end-value-id uint))
+  (let 
+    ((start-value (unwrap! (get-property-value property-id start-value-id) ERR-VALUE-RECORD-NOT-FOUND))
+     (end-value (unwrap! (get-property-value property-id end-value-id) ERR-VALUE-RECORD-NOT-FOUND))
+     (start-amount (get market-value start-value))
+     (end-amount (get market-value end-value)))
+    
+    (if (> end-amount start-amount)
+      (ok (- end-amount start-amount))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-property-value-history (property-id uint) (limit uint))
+  (let 
+    ((total-count (get count (get-property-value-count property-id))))
+    (if (> total-count u0)
+      (let 
+        ((start-id (if (> total-count limit) (- total-count limit) u1))
+         (end-id total-count))
+        (ok { start-id: start-id, end-id: end-id, total-count: total-count })
+      )
+      (ok { start-id: u0, end-id: u0, total-count: u0 })
+    )
+  )
+)
