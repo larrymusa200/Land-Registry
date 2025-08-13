@@ -1102,3 +1102,378 @@
     )
   )
 )
+
+;; Property Development Approval System Constants
+(define-constant ERR-APPLICATION-NOT-FOUND (err u130))
+(define-constant ERR-APPLICATION-EXISTS (err u131))
+(define-constant ERR-INVALID-APPLICATION-TYPE (err u132))
+(define-constant ERR-APPLICATION-EXPIRED (err u133))
+(define-constant ERR-APPROVAL-ALREADY-GRANTED (err u134))
+(define-constant ERR-INSUFFICIENT-REVIEW-TIME (err u135))
+(define-constant ERR-INVALID-DEVELOPMENT-PHASE (err u136))
+(define-constant ERR-COMPLIANCE-VIOLATION (err u137))
+
+;; Development application status constants
+(define-constant DEV-STATUS-SUBMITTED u1)
+(define-constant DEV-STATUS-UNDER-REVIEW u2)
+(define-constant DEV-STATUS-APPROVED u3)
+(define-constant DEV-STATUS-REJECTED u4)
+(define-constant DEV-STATUS-EXPIRED u5)
+(define-constant DEV-STATUS-REVOKED u6)
+
+;; Development application types
+(define-constant DEV-TYPE-BUILDING-PERMIT u1)
+(define-constant DEV-TYPE-ZONING-CHANGE u2)
+(define-constant DEV-TYPE-SUBDIVISION u3)
+(define-constant DEV-TYPE-RENOVATION u4)
+(define-constant DEV-TYPE-COMMERCIAL-USE u5)
+
+;; Development applications mapping
+(define-map development-applications
+  { property-id: uint, application-id: uint }
+  {
+    applicant: principal,
+    application-type: uint,
+    description: (string-ascii 200),
+    submitted-date: uint,
+    review-deadline: uint,
+    status: uint,
+    estimated-cost: uint,
+    estimated-duration: uint,
+    required-approvals: (list 5 (string-ascii 50)),
+    supporting-documents: (list 10 (buff 32))
+  }
+)
+
+;; Development approvals and decisions
+(define-map development-approvals
+  { property-id: uint, application-id: uint }
+  {
+    approver: principal,
+    approval-date: uint,
+    conditions: (string-ascii 300),
+    valid-until: uint,
+    compliance-requirements: (list 5 (string-ascii 100)),
+    inspection-schedule: (list 3 uint),
+    bonds-required: uint,
+    fees-paid: uint
+  }
+)
+
+;; Development phases tracking
+(define-map development-phases
+  { property-id: uint, application-id: uint, phase-id: uint }
+  {
+    phase-name: (string-ascii 50),
+    start-date: uint,
+    planned-end-date: uint,
+    actual-end-date: (optional uint),
+    phase-status: uint,
+    inspector: (optional principal),
+    compliance-score: uint,
+    issues-found: (list 5 (string-ascii 100))
+  }
+)
+
+;; Development inspection records
+(define-map development-inspections
+  { property-id: uint, application-id: uint, inspection-id: uint }
+  {
+    inspector: principal,
+    inspection-date: uint,
+    inspection-type: (string-ascii 50),
+    passed: bool,
+    violations: (list 5 (string-ascii 100)),
+    follow-up-required: bool,
+    next-inspection-date: (optional uint),
+    notes: (string-ascii 200)
+  }
+)
+
+;; Application counters
+(define-data-var next-application-id uint u1)
+(define-data-var next-inspection-id uint u1)
+
+;; Track application counts per property
+(define-map property-application-count
+  { property-id: uint }
+  { count: uint }
+)
+
+;; Submit a new development application
+(define-public (submit-development-application
+    (property-id uint)
+    (application-type uint)
+    (description (string-ascii 200))
+    (estimated-cost uint)
+    (estimated-duration uint)
+    (required-approvals (list 5 (string-ascii 50)))
+    (supporting-documents (list 10 (buff 32))))
+  (let 
+    ((application-id (var-get next-application-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (review-deadline (+ current-time u2592000)) ;; 30 days in seconds
+     (property (unwrap! (get-property property-id) ERR-PROPERTY-NOT-FOUND))
+     (current-count (get count (default-to { count: u0 } 
+                                 (map-get? property-application-count { property-id: property-id })))))
+    
+    ;; Verify property ownership and basic validations
+    (asserts! (is-eq (get owner property) tx-sender) ERR-NOT-OWNER)
+    (asserts! (get verified property) ERR-VERIFICATION-REQUIRED)
+    (asserts! (and (>= application-type DEV-TYPE-BUILDING-PERMIT) 
+                   (<= application-type DEV-TYPE-COMMERCIAL-USE)) ERR-INVALID-APPLICATION-TYPE)
+    (asserts! (> estimated-cost u0) ERR-INVALID-PRICE)
+    (asserts! (> estimated-duration u0) ERR-INVALID-PRICE)
+    
+    ;; Ensure this is a new application entry
+    (asserts! (is-none (get-development-application property-id application-id)) ERR-APPLICATION-EXISTS)
+    
+    ;; Create the development application
+    (map-set development-applications
+      { property-id: property-id, application-id: application-id }
+      {
+        applicant: tx-sender,
+        application-type: application-type,
+        description: description,
+        submitted-date: current-time,
+        review-deadline: review-deadline,
+        status: DEV-STATUS-SUBMITTED,
+        estimated-cost: estimated-cost,
+        estimated-duration: estimated-duration,
+        required-approvals: required-approvals,
+        supporting-documents: supporting-documents
+      }
+    )
+    
+    ;; Update application counter
+    (map-set property-application-count
+      { property-id: property-id }
+      { count: (+ current-count u1) }
+    )
+    
+    (var-set next-application-id (+ application-id u1))
+    (ok application-id)
+  )
+)
+
+;; Review and update application status (government verifiers only)
+(define-public (review-development-application
+    (property-id uint)
+    (application-id uint)
+    (new-status uint)
+    (review-notes (string-ascii 200)))
+  (let 
+    ((application (unwrap! (get-development-application property-id application-id) ERR-APPLICATION-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    
+    ;; Only authorized verifiers can review applications
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Validate status transition
+    (asserts! (and (>= new-status DEV-STATUS-SUBMITTED) 
+                   (<= new-status DEV-STATUS-REVOKED)) ERR-INVALID-APPLICATION-TYPE)
+    
+    ;; Check if application hasn't expired
+    (asserts! (< current-time (get review-deadline application)) ERR-APPLICATION-EXPIRED)
+    
+    ;; Update application status
+    (map-set development-applications
+      { property-id: property-id, application-id: application-id }
+      (merge application { status: new-status })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Grant development approval with conditions
+(define-public (grant-development-approval
+    (property-id uint)
+    (application-id uint)
+    (conditions (string-ascii 300))
+    (validity-duration uint)
+    (compliance-requirements (list 5 (string-ascii 100)))
+    (inspection-schedule (list 3 uint))
+    (bonds-required uint))
+  (let 
+    ((application (unwrap! (get-development-application property-id application-id) ERR-APPLICATION-NOT-FOUND))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (valid-until (+ current-time validity-duration)))
+    
+    ;; Only authorized verifiers can grant approvals
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Application must be under review to be approved
+    (asserts! (is-eq (get status application) DEV-STATUS-UNDER-REVIEW) ERR-INVALID-APPLICATION-TYPE)
+    
+    ;; Check for existing approval
+    (asserts! (is-none (get-development-approval property-id application-id)) ERR-APPROVAL-ALREADY-GRANTED)
+    
+    ;; Create the approval record
+    (map-set development-approvals
+      { property-id: property-id, application-id: application-id }
+      {
+        approver: tx-sender,
+        approval-date: current-time,
+        conditions: conditions,
+        valid-until: valid-until,
+        compliance-requirements: compliance-requirements,
+        inspection-schedule: inspection-schedule,
+        bonds-required: bonds-required,
+        fees-paid: u0
+      }
+    )
+    
+    ;; Update application status to approved
+    (map-set development-applications
+      { property-id: property-id, application-id: application-id }
+      (merge application { status: DEV-STATUS-APPROVED })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Record development inspection
+(define-public (record-development-inspection
+    (property-id uint)
+    (application-id uint)
+    (inspection-type (string-ascii 50))
+    (passed bool)
+    (violations (list 5 (string-ascii 100)))
+    (follow-up-required bool)
+    (next-inspection-date (optional uint))
+    (notes (string-ascii 200)))
+  (let 
+    ((inspection-id (var-get next-inspection-id))
+     (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (approval (unwrap! (get-development-approval property-id application-id) ERR-APPLICATION-NOT-FOUND)))
+    
+    ;; Only authorized verifiers can conduct inspections
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Approval must exist and be valid
+    (asserts! (< current-time (get valid-until approval)) ERR-APPLICATION-EXPIRED)
+    
+    ;; Create inspection record
+    (map-set development-inspections
+      { property-id: property-id, application-id: application-id, inspection-id: inspection-id }
+      {
+        inspector: tx-sender,
+        inspection-date: current-time,
+        inspection-type: inspection-type,
+        passed: passed,
+        violations: violations,
+        follow-up-required: follow-up-required,
+        next-inspection-date: next-inspection-date,
+        notes: notes
+      }
+    )
+    
+    (var-set next-inspection-id (+ inspection-id u1))
+    (ok inspection-id)
+  )
+)
+
+;; Track development phases
+(define-public (create-development-phase
+    (property-id uint)
+    (application-id uint)
+    (phase-id uint)
+    (phase-name (string-ascii 50))
+    (planned-duration uint))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (planned-end-date (+ current-time planned-duration))
+     (approval (unwrap! (get-development-approval property-id application-id) ERR-APPLICATION-NOT-FOUND)))
+    
+    ;; Only property owner or verifier can create phases
+    (asserts! (or (is-property-owner property-id tx-sender) 
+                  (get active (is-verifier tx-sender))) ERR-NOT-AUTHORIZED)
+    
+    ;; Approval must be valid
+    (asserts! (< current-time (get valid-until approval)) ERR-APPLICATION-EXPIRED)
+    
+    ;; Create development phase
+    (map-set development-phases
+      { property-id: property-id, application-id: application-id, phase-id: phase-id }
+      {
+        phase-name: phase-name,
+        start-date: current-time,
+        planned-end-date: planned-end-date,
+        actual-end-date: none,
+        phase-status: DEV-STATUS-SUBMITTED,
+        inspector: none,
+        compliance-score: u0,
+        issues-found: (list)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Complete development phase
+(define-public (complete-development-phase
+    (property-id uint)
+    (application-id uint)
+    (phase-id uint)
+    (compliance-score uint)
+    (issues-found (list 5 (string-ascii 100))))
+  (let 
+    ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+     (phase (unwrap! (get-development-phase property-id application-id phase-id) ERR-INVALID-DEVELOPMENT-PHASE)))
+    
+    ;; Only verifiers can complete phases
+    (asserts! (get active (is-verifier tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Validate compliance score
+    (asserts! (<= compliance-score u100) ERR-INVALID-PRICE)
+    
+    ;; Update phase completion
+    (map-set development-phases
+      { property-id: property-id, application-id: application-id, phase-id: phase-id }
+      (merge phase {
+        actual-end-date: (some current-time),
+        phase-status: DEV-STATUS-APPROVED,
+        inspector: (some tx-sender),
+        compliance-score: compliance-score,
+        issues-found: issues-found
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for development system
+(define-read-only (get-development-application (property-id uint) (application-id uint))
+  (map-get? development-applications { property-id: property-id, application-id: application-id })
+)
+
+(define-read-only (get-development-approval (property-id uint) (application-id uint))
+  (map-get? development-approvals { property-id: property-id, application-id: application-id })
+)
+
+(define-read-only (get-development-phase (property-id uint) (application-id uint) (phase-id uint))
+  (map-get? development-phases { property-id: property-id, application-id: application-id, phase-id: phase-id })
+)
+
+(define-read-only (get-development-inspection (property-id uint) (application-id uint) (inspection-id uint))
+  (map-get? development-inspections { property-id: property-id, application-id: application-id, inspection-id: inspection-id })
+)
+
+(define-read-only (get-application-count (property-id uint))
+  (default-to { count: u0 } (map-get? property-application-count { property-id: property-id }))
+)
+
+;; Helper function to check application status
+(define-read-only (get-application-status (property-id uint) (application-id uint))
+  (match (get-development-application property-id application-id)
+    app (some (get status app))
+    none
+  )
+)
+
+
+
