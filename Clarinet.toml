@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Land-Registry.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.property-neighborhoods]
+path = 'contracts/property-neighborhoods.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
